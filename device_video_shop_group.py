@@ -1,7 +1,6 @@
 # device_video_shop_group.py
 # Run: uvicorn device_video_shop_group:app --host 0.0.0.0 --port 8005 --reload
 # Enhanced with: rotation, fit_mode, content_type, logs, counter reset, online threshold
-# FIX: Add GET /video/{video_name} and GET /video/{video_name}/presign for dashboard preview
 
 import os
 import io
@@ -41,7 +40,7 @@ ONLINE_THRESHOLD_SECONDS = 60
 # Treat any of these as "no group"
 NO_GROUP_SENTINELS = {"_none", "none", "null", "(none)", ""}
 
-app = FastAPI(title="Device-Video-Shop-Group Service", version="3.0.1")
+app = FastAPI(title="Device-Video-Shop-Group Service", version="3.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -183,23 +182,17 @@ class VideoFitModeUpdateIn(BaseModel):
     fit_mode: str
 
 
-# NEW: Video metadata output (used by GET /video/{video_name})
 class VideoOut(BaseModel):
     id: int
     video_name: str
     s3_link: Optional[str] = None
     rotation: int = 0
-    content_type: str = "video"
-    fit_mode: str = "cover"
-    display_duration: int = 10
+    content_type: Optional[str] = "video"
+    fit_mode: Optional[str] = "cover"
+    display_duration: Optional[int] = 10
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
-    # optional helpers for preview
-    url: Optional[str] = None
-    presigned_url: Optional[str] = None
-    expires_in: Optional[int] = None
-    filename: Optional[str] = None
 
 
 # ---------- PG pool ----------
@@ -259,11 +252,11 @@ def _check_and_reset_counters(conn, did: int) -> Tuple[bool, bool]:
     month_start = today.replace(day=1)
     daily_reset = False
     monthly_reset = False
-
+    
     with conn.cursor() as cur:
         cur.execute(
             """
-            SELECT last_daily_reset, last_monthly_reset
+            SELECT last_daily_reset, last_monthly_reset 
             FROM public.device WHERE id = %s;
             """,
             (did,)
@@ -271,34 +264,34 @@ def _check_and_reset_counters(conn, did: int) -> Tuple[bool, bool]:
         row = cur.fetchone()
         if not row:
             return False, False
-
+        
         last_daily = row[0]
         last_monthly = row[1]
-
+        
         updates = []
         params = []
-
+        
         # Reset daily if last reset was before today
         if last_daily is None or last_daily < today:
             updates.append("daily_count = 0")
             updates.append("last_daily_reset = %s")
             params.append(today)
             daily_reset = True
-
+        
         # Reset monthly if last reset was before this month
         if last_monthly is None or last_monthly < month_start:
             updates.append("monthly_count = 0")
             updates.append("last_monthly_reset = %s")
             params.append(month_start)
             monthly_reset = True
-
+        
         if updates:
             params.append(did)
             cur.execute(
                 f"UPDATE public.device SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s;",
                 tuple(params)
             )
-
+    
     return daily_reset, monthly_reset
 
 
@@ -313,6 +306,20 @@ def _log_event(conn, did: int, log_type: str, value: float = None):
             (did, log_type, value)
         )
 
+
+
+
+
+def _insert_temperature_point(conn, did: int, temperature: float):
+    """Store a temperature point in temperature (time-series for reports)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO public.temperature (did, temperature, recorded_at)
+            VALUES (%s, %s, NOW());
+            """,
+            (did, temperature),
+        )
 
 # ---------- SQL helpers ----------
 READ_JOIN_SQL = """
@@ -490,13 +497,10 @@ def parse_s3_uri(s3_uri: str) -> Tuple[str, str]:
 
 
 def presign_get_object(s3_uri: str, expires_in: int = PRESIGN_EXPIRES) -> Tuple[str, str]:
-    """
-    Existing presign used for downloads (kept as-is).
-    """
     bucket, key = parse_s3_uri(s3_uri)
     s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
     filename = key.split("/")[-1] or "download.mp4"
-
+    
     # Detect content type from extension
     ext = filename.lower().split('.')[-1] if '.' in filename else 'mp4'
     content_types = {
@@ -507,7 +511,7 @@ def presign_get_object(s3_uri: str, expires_in: int = PRESIGN_EXPIRES) -> Tuple[
         'pdf': 'application/pdf',
     }
     content_type = content_types.get(ext, 'video/mp4')
-
+    
     params = {
         "Bucket": bucket,
         "Key": key,
@@ -516,63 +520,6 @@ def presign_get_object(s3_uri: str, expires_in: int = PRESIGN_EXPIRES) -> Tuple[
     }
     url = s3.generate_presigned_url("get_object", Params=params, ExpiresIn=expires_in)
     return url, filename
-
-
-def presign_get_object_inline(s3_uri: str, expires_in: int = PRESIGN_EXPIRES) -> Tuple[str, str]:
-    """
-    NEW: Inline presign for preview/playback in browser.
-    """
-    bucket, key = parse_s3_uri(s3_uri)
-    s3 = boto3.client("s3", region_name=AWS_REGION) if AWS_REGION else boto3.client("s3")
-    filename = key.split("/")[-1] or "video.mp4"
-
-    ext = filename.lower().split('.')[-1] if '.' in filename else 'mp4'
-    content_types = {
-        'mp4': 'video/mp4', 'webm': 'video/webm', 'mov': 'video/quicktime',
-        'jpg': 'image/jpeg', 'jpeg': 'image/jpeg', 'png': 'image/png',
-        'gif': 'image/gif', 'webp': 'image/webp',
-        'html': 'text/html', 'htm': 'text/html',
-        'pdf': 'application/pdf',
-    }
-    content_type = content_types.get(ext, 'video/mp4')
-
-    params = {
-        "Bucket": bucket,
-        "Key": key,
-        "ResponseContentDisposition": f'inline; filename="{filename}"',
-        "ResponseContentType": content_type,
-    }
-    url = s3.generate_presigned_url("get_object", Params=params, ExpiresIn=expires_in)
-    return url, filename
-
-
-# NEW: video fetch helper (for GET /video/{video_name})
-def fetch_video_by_name(conn, video_name: str) -> Optional[Dict[str, Any]]:
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at
-            FROM public.video
-            WHERE video_name = %s
-            ORDER BY id DESC
-            LIMIT 1;
-            """,
-            (video_name,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-        return {
-            "id": int(row[0]),
-            "video_name": row[1],
-            "s3_link": row[2],
-            "rotation": int(row[3] or 0),
-            "content_type": row[4] or "video",
-            "fit_mode": row[5] or "cover",
-            "display_duration": int(row[6] or 10),
-            "created_at": row[7],
-            "updated_at": row[8],
-        }
 
 
 # ---------- Group video operations ----------
@@ -620,7 +567,7 @@ def _set_group_video(conn, gid: int, vid: int):
     with conn.cursor() as cur:
         cur.execute("SELECT DISTINCT did FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
         dev_ids = [r[0] for r in cur.fetchall()]
-
+        
         cur.execute("""
         WITH targets AS (
             SELECT did, sid, gid FROM public.device_video_shop_group WHERE gid = %s GROUP BY did, sid, gid
@@ -643,17 +590,17 @@ def _set_group_video(conn, gid: int, vid: int):
         SELECT (SELECT COUNT(*) FROM ins)::int, (SELECT COUNT(*) FROM del)::int, (SELECT COUNT(*) FROM upd)::int;
         """, (gid, vid, vid, vid))
         inserted, deleted, remaining = cur.fetchone()
-
+        
         cur.execute('SELECT gname FROM public."group" WHERE id = %s;', (gid,))
         gname = cur.fetchone()[0]
         cur.execute("SELECT video_name FROM public.video WHERE id = %s;", (vid,))
         video_name = cur.fetchone()[0]
-
+        
         devices_marked = 0
         if dev_ids:
             cur.execute("UPDATE public.device SET download_status = FALSE, updated_at = NOW() WHERE id = ANY(%s);", (dev_ids,))
             devices_marked = cur.rowcount or 0
-
+    
     return inserted, deleted, remaining, gname, video_name, devices_marked
 
 
@@ -662,7 +609,7 @@ def _set_group_videos(conn, gid: int, vids: List[int]):
     with conn.cursor() as cur:
         cur.execute("SELECT DISTINCT did FROM public.device_video_shop_group WHERE gid = %s;", (gid,))
         dev_ids = [r[0] for r in cur.fetchall()]
-
+        
         cur.execute("""
         WITH targets AS (
             SELECT did, sid, gid FROM public.device_video_shop_group WHERE gid = %s GROUP BY did, sid, gid
@@ -687,17 +634,17 @@ def _set_group_videos(conn, gid: int, vids: List[int]):
         SELECT (SELECT COUNT(*) FROM ins)::int, (SELECT COUNT(*) FROM del)::int, (SELECT COUNT(*) FROM upd)::int;
         """, (gid, vids, vids, vids))
         inserted, deleted, updated = cur.fetchone()
-
+        
         cur.execute('SELECT gname FROM public."group" WHERE id = %s;', (gid,))
         gname = cur.fetchone()[0]
         cur.execute("SELECT video_name FROM public.video WHERE id = ANY(%s::bigint[]) ORDER BY video_name;", (vids,))
         video_names = [r[0] for r in cur.fetchall()]
-
+        
         devices_marked = 0
         if dev_ids:
             cur.execute("UPDATE public.device SET download_status = FALSE, updated_at = NOW() WHERE id = ANY(%s);", (dev_ids,))
             devices_marked = cur.rowcount or 0
-
+    
     return inserted, deleted, updated, gname, video_names, devices_marked
 
 
@@ -705,7 +652,7 @@ def _set_nogroup_video(conn, vid: int):
     with conn.cursor() as cur:
         cur.execute("SELECT DISTINCT did FROM public.device_video_shop_group WHERE gid IS NULL;")
         dev_ids = [r[0] for r in cur.fetchall()]
-
+        
         cur.execute("""
         WITH targets AS (SELECT did, sid FROM public.device_video_shop_group WHERE gid IS NULL GROUP BY did, sid),
         ins AS (INSERT INTO public.device_video_shop_group (did, vid, sid, gid) SELECT t.did, %s, t.sid, NULL FROM targets t ON CONFLICT DO NOTHING RETURNING id),
@@ -714,15 +661,15 @@ def _set_nogroup_video(conn, vid: int):
         SELECT (SELECT COUNT(*) FROM ins)::int, (SELECT COUNT(*) FROM del)::int, (SELECT COUNT(*) FROM upd)::int;
         """, (vid, vid, vid))
         inserted, deleted, remaining = cur.fetchone()
-
+        
         cur.execute("SELECT video_name FROM public.video WHERE id = %s;", (vid,))
         video_name = cur.fetchone()[0]
-
+        
         devices_marked = 0
         if dev_ids:
             cur.execute("UPDATE public.device SET download_status = FALSE, updated_at = NOW() WHERE id = ANY(%s);", (dev_ids,))
             devices_marked = cur.rowcount or 0
-
+    
     return inserted, deleted, remaining, video_name, devices_marked
 
 
@@ -731,7 +678,7 @@ def _set_nogroup_videos(conn, vids: List[int]):
     with conn.cursor() as cur:
         cur.execute("SELECT DISTINCT did FROM public.device_video_shop_group WHERE gid IS NULL;")
         dev_ids = [r[0] for r in cur.fetchall()]
-
+        
         cur.execute("""
         WITH targets AS (SELECT did, sid FROM public.device_video_shop_group WHERE gid IS NULL GROUP BY did, sid),
         ins AS (INSERT INTO public.device_video_shop_group (did, vid, sid, gid) SELECT t.did, x, t.sid, NULL FROM targets t, UNNEST(%s::bigint[]) AS x ON CONFLICT DO NOTHING RETURNING id),
@@ -740,15 +687,15 @@ def _set_nogroup_videos(conn, vids: List[int]):
         SELECT (SELECT COUNT(*) FROM ins)::int, (SELECT COUNT(*) FROM del)::int, (SELECT COUNT(*) FROM upd)::int;
         """, (vids, vids, vids))
         inserted, deleted, updated = cur.fetchone()
-
+        
         cur.execute("SELECT video_name FROM public.video WHERE id = ANY(%s::bigint[]) ORDER BY video_name;", (vids,))
         video_names = [r[0] for r in cur.fetchall()]
-
+        
         devices_marked = 0
         if dev_ids:
             cur.execute("UPDATE public.device SET download_status = FALSE, updated_at = NOW() WHERE id = ANY(%s);", (dev_ids,))
             devices_marked = cur.rowcount or 0
-
+    
     return inserted, deleted, updated, video_names, devices_marked
 
 
@@ -757,20 +704,20 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
     did = get_device_id_by_mobile(conn, payload.mobile_id)
     if did is None:
         raise HTTPException(status_code=404, detail=f"Device not found: {payload.mobile_id}")
-
+    
     with conn.cursor() as cur:
         cur.execute("SELECT id FROM public.video WHERE video_name = %s ORDER BY id DESC LIMIT 1;", (payload.video_name,))
         vrow = cur.fetchone()
         if not vrow:
             raise HTTPException(status_code=404, detail=f"Video not found: {payload.video_name}")
         vid = int(vrow[0])
-
+        
         cur.execute("SELECT id FROM public.shop WHERE shop_name = %s ORDER BY id DESC LIMIT 1;", (payload.shop_name,))
         srow = cur.fetchone()
         if not srow:
             raise HTTPException(status_code=404, detail=f"Shop not found: {payload.shop_name}")
         sid = int(srow[0])
-
+        
         gid = None
         gname_in = (payload.gname or "").strip()
         if gname_in and gname_in.lower() not in NO_GROUP_SENTINELS:
@@ -779,9 +726,9 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
             if not grow:
                 raise HTTPException(status_code=404, detail=f"Group not found: {gname_in}")
             gid = int(grow[0])
-
+        
         _enforce_single_group_shop_for_device(conn, did, gid, sid)
-
+        
         if gid is None:
             cur.execute("""
                 INSERT INTO public.device_video_shop_group (did, vid, sid, gid, display_order)
@@ -798,12 +745,12 @@ def create_link_by_names(conn, payload: LinkCreate) -> Dict[str, Any]:
                 DO UPDATE SET updated_at = NOW(), display_order = EXCLUDED.display_order
                 RETURNING id;
             """, (did, vid, sid, gid, payload.display_order))
-
+        
         lrow = cur.fetchone()
         cur.execute(READ_JOIN_SQL + " WHERE l.id = %s;", (lrow[0],))
         full = cur.fetchone()
         _write_device_flag(conn, did, False)
-
+    
     return _row_to_link_dict(full)
 
 
@@ -845,90 +792,6 @@ def pool_stats():
     return {"minconn": pg_pool.minconn, "maxconn": pg_pool.maxconn, "used": len(pg_pool._used), "free": len(pg_pool._pool)}
 
 
-# ---------- NEW: Video preview endpoints (fix 404 for UI) ----------
-@app.get("/video/{video_name}", response_model=VideoOut)
-def get_video(video_name: str = Path(...), presign: bool = Query(True), expires_in: int = Query(PRESIGN_EXPIRES, ge=60, le=604800)):
-    """
-    Returns video metadata from public.video.
-    If presign=true:
-      - if s3_link is https://... -> returns it directly
-      - if s3_link is s3://bucket/key -> returns presigned URL (inline)
-    """
-    with pg_conn() as conn:
-        v = fetch_video_by_name(conn, video_name)
-
-    if not v:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    s3_link = (v.get("s3_link") or "").strip()
-    if not s3_link:
-        raise HTTPException(status_code=404, detail="Video s3_link is not set")
-
-    # If already a public URL, return it
-    if s3_link.startswith("http://") or s3_link.startswith("https://"):
-        v["url"] = s3_link
-        v["presigned_url"] = s3_link
-        v["expires_in"] = 0
-        v["filename"] = s3_link.split("/")[-1] or "video"
-        return VideoOut(**v)
-
-    # Otherwise presign s3://...
-    if presign:
-        try:
-            url, filename = presign_get_object_inline(s3_link, expires_in=expires_in)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="Invalid s3_link format. Expected s3://bucket/key or https://...")
-        v["url"] = url
-        v["presigned_url"] = url
-        v["expires_in"] = expires_in
-        v["filename"] = filename
-
-    return VideoOut(**v)
-
-
-@app.get("/video/{video_name}/presign")
-def presign_video(video_name: str = Path(...), expires_in: int = Query(PRESIGN_EXPIRES, ge=60, le=604800)):
-    """
-    UI expects this endpoint.
-    Returns {url, presigned_url, expires_in}.
-    """
-    with pg_conn() as conn:
-        v = fetch_video_by_name(conn, video_name)
-
-    if not v:
-        raise HTTPException(status_code=404, detail="Video not found")
-
-    s3_link = (v.get("s3_link") or "").strip()
-    if not s3_link:
-        raise HTTPException(status_code=404, detail="Video s3_link is not set")
-
-    # Public URL
-    if s3_link.startswith("http://") or s3_link.startswith("https://"):
-        filename = s3_link.split("/")[-1] or "video"
-        return {
-            "video_name": video_name,
-            "s3_link": s3_link,
-            "url": s3_link,
-            "presigned_url": s3_link,
-            "expires_in": 0,
-            "filename": filename,
-        }
-
-    # Presign s3://...
-    try:
-        url, filename = presign_get_object_inline(s3_link, expires_in=expires_in)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid s3_link format. Expected s3://bucket/key or https://...")
-    return {
-        "video_name": video_name,
-        "s3_link": s3_link,
-        "url": url,
-        "presigned_url": url,
-        "expires_in": expires_in,
-        "filename": filename,
-    }
-
-
 # ---------- Device counts ----------
 @app.get("/device/{mobile_id}/counts", response_model=DeviceCountsOut)
 def get_device_counts(mobile_id: str):
@@ -962,13 +825,13 @@ def list_group_videos_by_name(gname: str):
                 """)
                 rows = cur.fetchall() or []
                 return {"gid": None, "gname": None, "vids": [r[0] for r in rows], "video_names": [r[1] for r in rows], "count": len(rows)}
-
+            
             cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (gname,))
             grow = cur.fetchone()
             if not grow:
                 raise HTTPException(status_code=404, detail=f"Group not found: {gname}")
             gid = int(grow[0])
-
+            
             cur.execute("""
                 SELECT DISTINCT v.id, v.video_name
                 FROM public.device_video_shop_group l
@@ -981,7 +844,7 @@ def list_group_videos_by_name(gname: str):
 
 # ---------- Temperature, daily, monthly updates ----------
 @app.post("/device/{mobile_id}/temperature_update")
-def set_device_temperature(mobile_id: str, body: DeviceTemperatureUpdateIn):
+def set_temperature(mobile_id: str, body: DeviceTemperatureUpdateIn):
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
@@ -990,16 +853,19 @@ def set_device_temperature(mobile_id: str, body: DeviceTemperatureUpdateIn):
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
-
+                
                 cur.execute("""
                     UPDATE public.device SET temperature = %s, updated_at = NOW()
                     WHERE id = %s RETURNING temperature;
                 """, (body.temperature, did))
                 temp = cur.fetchone()[0]
-
+                
                 # Log temperature
                 _log_event(conn, did, 'temperature', body.temperature)
+            
 
+                # Store time-series point for line graph
+                _insert_temperature_point(conn, did, float(body.temperature))
             conn.commit()
             return {"mobile_id": mobile_id, "temperature": float(temp)}
         except HTTPException:
@@ -1008,6 +874,51 @@ def set_device_temperature(mobile_id: str, body: DeviceTemperatureUpdateIn):
         except:
             conn.rollback()
             raise
+
+
+
+
+
+@app.get("/device/{mobile_id}/temperature_series")
+def get_temperature_series(
+    mobile_id: str,
+    days: int = Query(30, ge=1, le=365),
+    bucket: str = Query("day"),
+):
+    """
+    Time-series temperature data for line graph.
+    - days: how many days back (default 30 for monthly view)
+    - bucket: 'day' or 'hour' (averages values inside each bucket)
+    """
+    bucket = (bucket or "day").lower().strip()
+    if bucket not in ("day", "hour"):
+        raise HTTPException(status_code=422, detail="bucket must be 'day' or 'hour'")
+
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Device not found")
+            did = int(row[0])
+
+            cur.execute(
+                """
+                SELECT
+                  date_trunc(%s, recorded_at) AS t,
+                  AVG(temperature)::double precision AS temperature
+                FROM public.temperature
+                WHERE did = %s
+                  AND recorded_at >= NOW() - (%s || ' days')::interval
+                GROUP BY 1
+                ORDER BY 1;
+                """,
+                (bucket, did, days),
+            )
+            rows = cur.fetchall() or []
+
+    items = [{"t": r[0].isoformat(), "temperature": float(r[1])} for r in rows]
+    return {"mobile_id": mobile_id, "bucket": bucket, "days": days, "count": len(items), "items": items}
 
 
 @app.post("/device/{mobile_id}/daily_update")
@@ -1020,16 +931,16 @@ def set_device_daily_count(mobile_id: str, body: DeviceDailyCountUpdateIn):
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
-
+            
             _check_and_reset_counters(conn, did)
-
+            
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE public.device SET daily_count = %s, updated_at = NOW()
                     WHERE id = %s RETURNING daily_count;
                 """, (body.daily_count, did))
                 count = cur.fetchone()[0]
-
+            
             conn.commit()
             return {"mobile_id": mobile_id, "daily_count": int(count)}
         except HTTPException:
@@ -1050,16 +961,16 @@ def set_device_monthly_count(mobile_id: str, body: DeviceMonthlyCountUpdateIn):
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
-
+            
             _check_and_reset_counters(conn, did)
-
+            
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE public.device SET monthly_count = %s, updated_at = NOW()
                     WHERE id = %s RETURNING monthly_count;
                 """, (body.monthly_count, did))
                 count = cur.fetchone()[0]
-
+            
             conn.commit()
             return {"mobile_id": mobile_id, "monthly_count": int(count)}
         except HTTPException:
@@ -1081,14 +992,14 @@ def record_door_open(mobile_id: str):
                 if not row:
                     raise HTTPException(status_code=404, detail="Device not found")
                 did = row[0]
-
+            
             # Check and reset counters first
             _check_and_reset_counters(conn, did)
-
+            
             with conn.cursor() as cur:
                 # Increment both counters
                 cur.execute("""
-                    UPDATE public.device
+                    UPDATE public.device 
                     SET daily_count = daily_count + 1,
                         monthly_count = monthly_count + 1,
                         updated_at = NOW()
@@ -1096,10 +1007,10 @@ def record_door_open(mobile_id: str):
                     RETURNING daily_count, monthly_count;
                 """, (did,))
                 daily, monthly = cur.fetchone()
-
+                
                 # Log the door open event
                 _log_event(conn, did, 'door_open', 1)
-
+            
             conn.commit()
             return {"mobile_id": mobile_id, "daily_count": daily, "monthly_count": monthly}
         except HTTPException:
@@ -1204,7 +1115,7 @@ def list_download_urls_for_device(mobile_id: str, limit: int = Query(200, ge=1, 
         rows = fetch_links_for_mobile(conn, mobile_id, limit, offset)
     if not rows:
         raise HTTPException(status_code=404, detail="No video linked to this device")
-
+    
     items = []
     for r in rows:
         if not r.get("s3_link"):
@@ -1288,16 +1199,16 @@ def get_device_online_status(mobile_id: str):
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Device not found")
-
+            
             is_online = row[0]
             seconds_ago = row[2]
-
+            
             # If last heartbeat was more than threshold seconds ago, mark offline
             if seconds_ago is not None and seconds_ago > ONLINE_THRESHOLD_SECONDS:
                 is_online = False
                 cur.execute("UPDATE public.device SET is_online = FALSE WHERE mobile_id = %s;", (mobile_id,))
                 conn.commit()
-
+            
             return DeviceOnlineStatusOut(mobile_id=mobile_id, is_online=bool(is_online))
 
 
@@ -1307,7 +1218,7 @@ def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE public.device
+                    UPDATE public.device 
                     SET is_online = %s, last_online_at = NOW(), updated_at = NOW()
                     WHERE mobile_id = %s
                     RETURNING is_online;
@@ -1335,7 +1246,7 @@ def create_device_with_linking(body: DeviceCreateIn):
                 # Check if device exists
                 cur.execute("SELECT id FROM public.device WHERE mobile_id = %s ORDER BY id DESC LIMIT 1;", (body.mobile_id,))
                 existing = cur.fetchone()
-
+                
                 if existing:
                     did = existing[0]
                 else:
@@ -1346,7 +1257,7 @@ def create_device_with_linking(body: DeviceCreateIn):
                         RETURNING id;
                     """, (body.mobile_id,))
                     did = cur.fetchone()[0]
-
+                
                 result = {
                     "device_id": did,
                     "mobile_id": body.mobile_id,
@@ -1356,7 +1267,7 @@ def create_device_with_linking(body: DeviceCreateIn):
                     "gname": None,
                     "shop_name": None,
                 }
-
+                
                 # If group and shop provided, create a link
                 if body.group_name and body.shop_name:
                     cur.execute('SELECT id FROM public."group" WHERE gname = %s ORDER BY id DESC LIMIT 1;', (body.group_name,))
@@ -1365,24 +1276,24 @@ def create_device_with_linking(body: DeviceCreateIn):
                         conn.rollback()
                         raise HTTPException(status_code=404, detail=f"Group not found: {body.group_name}")
                     gid = grow[0]
-
+                    
                     cur.execute("SELECT id FROM public.shop WHERE shop_name = %s ORDER BY id DESC LIMIT 1;", (body.shop_name,))
                     srow = cur.fetchone()
                     if not srow:
                         conn.rollback()
                         raise HTTPException(status_code=404, detail=f"Shop not found: {body.shop_name}")
                     sid = srow[0]
-
+                    
                     # Get first video from group (if any)
                     cur.execute("""
-                        SELECT DISTINCT v.id
+                        SELECT DISTINCT v.id 
                         FROM public.device_video_shop_group dvsg
                         JOIN public.video v ON v.id = dvsg.vid
                         WHERE dvsg.gid = %s
                         LIMIT 1;
                     """, (gid,))
                     vrow = cur.fetchone()
-
+                    
                     if vrow:
                         vid = vrow[0]
                         cur.execute("""
@@ -1392,12 +1303,12 @@ def create_device_with_linking(body: DeviceCreateIn):
                             DO UPDATE SET updated_at = NOW()
                             RETURNING id;
                         """, (did, vid, sid, gid))
-
+                    
                     result["linked_to_group"] = True
                     result["linked_to_shop"] = True
                     result["gname"] = body.group_name
                     result["shop_name"] = body.shop_name
-
+            
             conn.commit()
             return result
         except HTTPException:
@@ -1450,6 +1361,95 @@ def set_group_videos_by_names(gname: str, body: GroupVideosUpdateIn):
         except:
             conn.rollback()
             raise
+
+
+# ---------- Video read + presign (for dashboard preview) ----------
+@app.get("/video/{video_name}", response_model=VideoOut)
+def get_video_by_name(video_name: str = Path(..., description="Exact video_name to fetch")):
+    """Return video metadata stored in public.video."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, video_name, s3_link, rotation, content_type, fit_mode, display_duration, created_at, updated_at
+                FROM public.video
+                WHERE video_name = %s
+                ORDER BY id DESC
+                LIMIT 1;
+                """,
+                (video_name,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Video not found")
+
+    return VideoOut(
+        id=row[0],
+        video_name=row[1],
+        s3_link=row[2],
+        rotation=row[3] or 0,
+        content_type=row[4] or "video",
+        fit_mode=row[5] or "cover",
+        display_duration=row[6] or 10,
+        created_at=row[7],
+        updated_at=row[8],
+    )
+
+
+@app.get("/video/{video_name}/presign")
+def presign_video(
+    video_name: str = Path(..., description="Exact video_name to presign"),
+    expires_in: int = Query(PRESIGN_EXPIRES, ge=60, le=604800, description="Presigned URL expiry in seconds"),
+):
+    """Generate a presigned URL for the video using its s3_link (s3://bucket/key)."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s3_link
+                FROM public.video
+                WHERE video_name = %s
+                ORDER BY id DESC
+                LIMIT 1;
+                """,
+                (video_name,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Video not found")
+            s3_link = row[0]
+
+    if not s3_link:
+        raise HTTPException(status_code=404, detail="Video s3_link is not set")
+
+    # If DB already stores a public HTTPS URL, return it directly.
+    if isinstance(s3_link, str) and (s3_link.startswith("http://") or s3_link.startswith("https://")):
+        filename = s3_link.split("/")[-1] or "download"
+        return {
+            "video_name": video_name,
+            "s3_link": s3_link,
+            "expires_in": 0,
+            "filename": filename,
+            "url": s3_link,
+            "presigned_url": s3_link,
+        }
+
+    try:
+        url, filename = presign_get_object(s3_link, expires_in=expires_in)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid s3_link format. Expected s3://bucket/key")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to presign: {type(e).__name__}: {e}")
+
+    # Frontend expects `url` OR `presigned_url`
+    return {
+        "video_name": video_name,
+        "s3_link": s3_link,
+        "expires_in": expires_in,
+        "filename": filename,
+        "url": url,
+        "presigned_url": url,
+    }
 
 
 # ---------- Video rotation and fit mode ----------
@@ -1520,10 +1520,10 @@ def get_device_logs(
             if not row:
                 raise HTTPException(status_code=404, detail="Device not found")
             did = row[0]
-
+            
             where = ["did = %s"]
             params = [did]
-
+            
             if log_type:
                 where.append("log_type = %s")
                 params.append(log_type)
@@ -1533,9 +1533,9 @@ def get_device_logs(
             if end_date:
                 where.append("logged_at < (%s::date + interval '1 day')")
                 params.append(end_date)
-
+            
             params.extend([limit, offset])
-
+            
             cur.execute(f"""
                 SELECT id, log_type, value, logged_at
                 FROM public.device_logs
@@ -1544,7 +1544,7 @@ def get_device_logs(
                 LIMIT %s OFFSET %s;
             """, tuple(params))
             rows = cur.fetchall()
-
+            
             items = [{"id": r[0], "log_type": r[1], "value": r[2], "logged_at": r[3]} for r in rows]
             return {"mobile_id": mobile_id, "count": len(items), "items": items}
 
@@ -1564,10 +1564,10 @@ def download_device_logs(
             if not row:
                 raise HTTPException(status_code=404, detail="Device not found")
             did = row[0]
-
+            
             where = ["did = %s"]
             params = [did]
-
+            
             if log_type:
                 where.append("log_type = %s")
                 params.append(log_type)
@@ -1577,7 +1577,7 @@ def download_device_logs(
             if end_date:
                 where.append("logged_at < (%s::date + interval '1 day')")
                 params.append(end_date)
-
+            
             cur.execute(f"""
                 SELECT log_type, value, logged_at
                 FROM public.device_logs
@@ -1585,13 +1585,13 @@ def download_device_logs(
                 ORDER BY logged_at DESC;
             """, tuple(params))
             rows = cur.fetchall()
-
+    
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["mobile_id", "log_type", "value", "logged_at"])
     for r in rows:
         writer.writerow([mobile_id, r[0], r[1], r[2].isoformat() if r[2] else ""])
-
+    
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
@@ -1616,7 +1616,7 @@ def get_all_devices_logs_summary(
             if end_date:
                 date_filter += " AND dl.logged_at < (%s::date + interval '1 day')"
                 params.append(end_date)
-
+            
             cur.execute(f"""
                 SELECT d.mobile_id,
                        COUNT(CASE WHEN dl.log_type = 'door_open' THEN 1 END) as door_open_count,
@@ -1629,7 +1629,7 @@ def get_all_devices_logs_summary(
                 ORDER BY d.mobile_id;
             """, tuple(params))
             rows = cur.fetchall()
-
+            
             items = [{
                 "mobile_id": r[0],
                 "door_open_count": r[1] or 0,
@@ -1656,7 +1656,7 @@ def download_all_devices_logs_summary(
             if end_date:
                 date_filter += " AND dl.logged_at < (%s::date + interval '1 day')"
                 params.append(end_date)
-
+            
             cur.execute(f"""
                 SELECT d.mobile_id, d.daily_count, d.monthly_count,
                        COUNT(CASE WHEN dl.log_type = 'door_open' THEN 1 END) as door_open_count,
@@ -1669,13 +1669,13 @@ def download_all_devices_logs_summary(
                 ORDER BY d.mobile_id;
             """, tuple(params))
             rows = cur.fetchall()
-
+    
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["mobile_id", "daily_count", "monthly_count", "door_open_count", "avg_temperature", "min_temperature", "max_temperature"])
     for r in rows:
         writer.writerow([r[0], r[1], r[2], r[3] or 0, round(float(r[4]), 2) if r[4] else "", r[5] or "", r[6] or ""])
-
+    
     output.seek(0)
     return StreamingResponse(
         iter([output.getvalue()]),
@@ -1695,7 +1695,7 @@ def mark_offline_devices():
                     UPDATE public.device
                     SET is_online = FALSE, updated_at = NOW()
                     WHERE is_online = TRUE
-                      AND (last_online_at IS NULL
+                      AND (last_online_at IS NULL 
                            OR last_online_at < NOW() - INTERVAL '{ONLINE_THRESHOLD_SECONDS} seconds')
                     RETURNING mobile_id;
                 """)
@@ -1716,4 +1716,3 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "8005")),
         reload=True,
     )
-
