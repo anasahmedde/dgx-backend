@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from dotenv import load_dotenv
 import psycopg2
+from psycopg2 import sql
 from psycopg2.pool import ThreadedConnectionPool, PoolError
 import boto3
 
@@ -41,6 +42,22 @@ ONLINE_THRESHOLD_SECONDS = 60
 NO_GROUP_SENTINELS = {"_none", "none", "null", "(none)", ""}
 
 app = FastAPI(title="Device-Video-Shop-Group Service", version="3.0.0")
+
+# --- CORS (frontend runs on different origin/port) ---
+_CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+if _CORS_ORIGINS.strip() == "*":
+    _origins = ["*"]
+else:
+    _origins = [o.strip() for o in _CORS_ORIGINS.split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -311,17 +328,58 @@ def _log_event(conn, did: int, log_type: str, value: float = None):
 
 
 def _insert_temperature_point(conn, did: int, temperature: float):
-    """Store a temperature point in temperature (time-series for reports)."""
+    """Store a temperature point for reports.
+
+    Compatibility notes:
+    - Some deployments created `public.device_temperature`
+    - New requirement uses `public.temperature`
+    We insert into whichever exists (prefer `temperature`).
+    """
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO public.temperature (did, temperature, recorded_at)
-            VALUES (%s, %s, NOW());
-            """,
-            (did, temperature),
-        )
+        # Prefer new table
+        cur.execute("SELECT to_regclass('public.temperature');")
+        has_temperature = cur.fetchone()[0] is not None
+
+        cur.execute("SELECT to_regclass('public.device_temperature');")
+        has_device_temperature = cur.fetchone()[0] is not None
+
+        if has_temperature:
+            cur.execute(
+                """
+                INSERT INTO public.temperature (did, temperature, recorded_at)
+                VALUES (%s, %s, NOW());
+                """,
+                (did, temperature),
+            )
+            return
+
+        if has_device_temperature:
+            # Some schemas used recorded_at, some created_at
+            cur.execute("""
+                SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='device_temperature' AND column_name='recorded_at'
+                LIMIT 1;
+            """)
+            ts_col = "recorded_at" if cur.fetchone() else "created_at"
+
+            q = sql.SQL("""
+                INSERT INTO {tbl} (did, temperature, {ts})
+                VALUES (%s, %s, NOW());
+            """).format(
+                tbl=sql.Identifier("public", "device_temperature"),
+                ts=sql.Identifier(ts_col),
+            )
+            cur.execute(q, (did, temperature))
+            return
+
+        # Last resort: store only in device_logs (already stored elsewhere typically)
+        try:
+            _log_event(conn, did, "temperature", temperature)
+        except Exception:
+            pass
 
 # ---------- SQL helpers ----------
+
 READ_JOIN_SQL = """
 SELECT l.id, l.did, l.vid, l.sid, l.gid, l.created_at, l.updated_at,
        d.mobile_id, d.is_online,
@@ -887,8 +945,14 @@ def get_temperature_series(
 ):
     """
     Time-series temperature data for line graph.
-    - days: how many days back (default 30 for monthly view)
+
+    - days: how many days back (default 30)
     - bucket: 'day' or 'hour' (averages values inside each bucket)
+
+    This endpoint supports multiple schema variants:
+    - public.temperature (new)
+    - public.device_temperature (legacy)
+    - public.device_logs with log_type='temperature' (fallback)
     """
     bucket = (bucket or "day").lower().strip()
     if bucket not in ("day", "hour"):
@@ -896,25 +960,65 @@ def get_temperature_series(
 
     with pg_conn() as conn:
         with conn.cursor() as cur:
+            # Resolve device id
             cur.execute("SELECT id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
             row = cur.fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="Device not found")
             did = int(row[0])
 
-            cur.execute(
-                """
+            # Pick best available source for temperature history
+            cur.execute("SELECT to_regclass('public.temperature');")
+            has_temperature = cur.fetchone()[0] is not None
+
+            cur.execute("SELECT to_regclass('public.device_temperature');")
+            has_device_temperature = cur.fetchone()[0] is not None
+
+            cur.execute("SELECT to_regclass('public.device_logs');")
+            has_device_logs = cur.fetchone()[0] is not None
+
+            if has_temperature:
+                table = "temperature"
+                ts_col = "recorded_at"
+                val_col = "temperature"
+                extra = sql.SQL("")
+            elif has_device_temperature:
+                table = "device_temperature"
+                # Some schemas used recorded_at, some created_at
+                cur.execute("""
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='device_temperature' AND column_name='recorded_at'
+                    LIMIT 1;
+                """)
+                ts_col = "recorded_at" if cur.fetchone() else "created_at"
+                val_col = "temperature"
+                extra = sql.SQL("")
+            elif has_device_logs:
+                table = "device_logs"
+                ts_col = "logged_at"
+                val_col = "value"
+                extra = sql.SQL("AND log_type = 'temperature'")
+            else:
+                return {"mobile_id": mobile_id, "bucket": bucket, "days": days, "count": 0, "items": []}
+
+            q = sql.SQL("""
                 SELECT
-                  date_trunc(%s, recorded_at) AS t,
-                  AVG(temperature)::double precision AS temperature
-                FROM public.temperature
+                  date_trunc(%s, {ts}) AS t,
+                  AVG({val})::double precision AS temperature
+                FROM {tbl}
                 WHERE did = %s
-                  AND recorded_at >= NOW() - (%s || ' days')::interval
+                  {extra}
+                  AND {ts} >= NOW() - (%s || ' days')::interval
                 GROUP BY 1
                 ORDER BY 1;
-                """,
-                (bucket, did, days),
+            """).format(
+                ts=sql.Identifier(ts_col),
+                val=sql.Identifier(val_col),
+                tbl=sql.Identifier("public", table),
+                extra=extra,
             )
+
+            cur.execute(q, (bucket, did, days))
             rows = cur.fetchall() or []
 
     items = [{"t": r[0].isoformat(), "temperature": float(r[1])} for r in rows]
