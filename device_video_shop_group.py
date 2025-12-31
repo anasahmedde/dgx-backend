@@ -1321,6 +1321,16 @@ def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
     with pg_conn() as conn:
         try:
             with conn.cursor() as cur:
+                # Get current status first
+                cur.execute("SELECT id, is_online FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
+                device_row = cur.fetchone()
+                if not device_row:
+                    raise HTTPException(status_code=404, detail="Device not found")
+                
+                did = device_row[0]
+                previous_status = device_row[1]
+                
+                # Update the device status
                 cur.execute("""
                     UPDATE public.device 
                     SET is_online = %s, last_online_at = NOW(), updated_at = NOW()
@@ -1328,8 +1338,15 @@ def set_device_online_status(mobile_id: str, body: DeviceOnlineUpdateIn):
                     RETURNING is_online;
                 """, (body.is_online, mobile_id))
                 row = cur.fetchone()
-                if not row:
-                    raise HTTPException(status_code=404, detail="Device not found")
+                
+                # Log status change if it actually changed
+                if previous_status != body.is_online:
+                    event_type = "online" if body.is_online else "offline"
+                    cur.execute("""
+                        INSERT INTO public.device_online_history (did, event_type, event_at)
+                        VALUES (%s, %s, NOW());
+                    """, (did, event_type))
+                
             conn.commit()
             return {"mobile_id": mobile_id, "is_online": bool(row[0])}
         except HTTPException:
@@ -1801,15 +1818,222 @@ def mark_offline_devices():
                     WHERE is_online = TRUE
                       AND (last_online_at IS NULL 
                            OR last_online_at < NOW() - INTERVAL '{ONLINE_THRESHOLD_SECONDS} seconds')
-                    RETURNING mobile_id;
+                    RETURNING id, mobile_id;
                 """)
                 rows = cur.fetchall()
-                marked = [r[0] for r in rows]
+                marked = [r[1] for r in rows]
+                
+                # Log offline events for all marked devices
+                for row in rows:
+                    cur.execute("""
+                        INSERT INTO public.device_online_history (did, event_type, event_at)
+                        VALUES (%s, 'offline', NOW());
+                    """, (row[0],))
+                
             conn.commit()
             return {"marked_offline": len(marked), "devices": marked}
         except:
             conn.rollback()
             raise
+
+
+# ---------- Online History Report ----------
+class OnlineHistoryItem(BaseModel):
+    id: int
+    event_type: str
+    event_at: datetime
+
+
+class OnlineHistoryOut(BaseModel):
+    mobile_id: str
+    items: List[OnlineHistoryItem]
+    count: int
+
+
+class UptimeStatsOut(BaseModel):
+    mobile_id: str
+    total_online_seconds: float
+    total_offline_seconds: float
+    online_percentage: float
+    total_online_events: int
+    total_offline_events: int
+    first_event: Optional[datetime]
+    last_event: Optional[datetime]
+    sessions: List[Dict[str, Any]]
+
+
+@app.get("/device/{mobile_id}/online_history")
+def get_device_online_history(
+    mobile_id: str,
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+    limit: int = Query(500, ge=1, le=5000),
+    offset: int = Query(0, ge=0),
+):
+    """Get online/offline history for a device."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Device not found")
+            did = row[0]
+            
+            where = ["did = %s"]
+            params = [did]
+            
+            if start_date:
+                where.append("event_at >= %s::date")
+                params.append(start_date)
+            if end_date:
+                where.append("event_at < (%s::date + interval '1 day')")
+                params.append(end_date)
+            
+            params.extend([limit, offset])
+            
+            cur.execute(f"""
+                SELECT id, event_type, event_at
+                FROM public.device_online_history
+                WHERE {' AND '.join(where)}
+                ORDER BY event_at DESC
+                LIMIT %s OFFSET %s;
+            """, tuple(params))
+            rows = cur.fetchall()
+            
+            items = [{"id": r[0], "event_type": r[1], "event_at": r[2]} for r in rows]
+            return {"mobile_id": mobile_id, "count": len(items), "items": items}
+
+
+@app.get("/device/{mobile_id}/uptime_report")
+def get_device_uptime_report(
+    mobile_id: str,
+    start_date: Optional[str] = Query(None, description="Start date YYYY-MM-DD"),
+    end_date: Optional[str] = Query(None, description="End date YYYY-MM-DD"),
+):
+    """Get uptime statistics for a device including session details."""
+    with pg_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, is_online FROM public.device WHERE mobile_id = %s LIMIT 1;", (mobile_id,))
+            row = cur.fetchone()
+            if not row:
+                raise HTTPException(status_code=404, detail="Device not found")
+            did = row[0]
+            current_status = row[1]
+            
+            where = ["did = %s"]
+            params = [did]
+            
+            if start_date:
+                where.append("event_at >= %s::date")
+                params.append(start_date)
+            if end_date:
+                where.append("event_at < (%s::date + interval '1 day')")
+                params.append(end_date)
+            
+            # Get all events in chronological order
+            cur.execute(f"""
+                SELECT id, event_type, event_at
+                FROM public.device_online_history
+                WHERE {' AND '.join(where)}
+                ORDER BY event_at ASC;
+            """, tuple(params))
+            rows = cur.fetchall()
+            
+            if not rows:
+                return {
+                    "mobile_id": mobile_id,
+                    "total_online_seconds": 0,
+                    "total_offline_seconds": 0,
+                    "online_percentage": 0,
+                    "total_online_events": 0,
+                    "total_offline_events": 0,
+                    "first_event": None,
+                    "last_event": None,
+                    "sessions": [],
+                }
+            
+            # Calculate sessions and uptime
+            sessions = []
+            total_online_seconds = 0
+            total_offline_seconds = 0
+            online_events = 0
+            offline_events = 0
+            
+            first_event = rows[0][2]
+            last_event = rows[-1][2]
+            
+            # Process events to create sessions
+            current_session_start = None
+            current_session_type = None
+            
+            for r in rows:
+                event_type = r[1]
+                event_at = r[2]
+                
+                if event_type == "online":
+                    online_events += 1
+                    if current_session_type == "offline" and current_session_start:
+                        # End offline session
+                        duration = (event_at - current_session_start).total_seconds()
+                        total_offline_seconds += duration
+                        sessions.append({
+                            "type": "offline",
+                            "start": current_session_start.isoformat(),
+                            "end": event_at.isoformat(),
+                            "duration_seconds": duration,
+                        })
+                    current_session_start = event_at
+                    current_session_type = "online"
+                else:  # offline
+                    offline_events += 1
+                    if current_session_type == "online" and current_session_start:
+                        # End online session
+                        duration = (event_at - current_session_start).total_seconds()
+                        total_online_seconds += duration
+                        sessions.append({
+                            "type": "online",
+                            "start": current_session_start.isoformat(),
+                            "end": event_at.isoformat(),
+                            "duration_seconds": duration,
+                        })
+                    current_session_start = event_at
+                    current_session_type = "offline"
+            
+            # Handle ongoing session (if device is currently online/offline)
+            from datetime import datetime as dt, timezone
+            now = dt.now(timezone.utc)
+            if current_session_start and current_session_type:
+                duration = (now - current_session_start).total_seconds()
+                if current_session_type == "online":
+                    total_online_seconds += duration
+                else:
+                    total_offline_seconds += duration
+                sessions.append({
+                    "type": current_session_type,
+                    "start": current_session_start.isoformat(),
+                    "end": None,  # Ongoing
+                    "duration_seconds": duration,
+                    "ongoing": True,
+                })
+            
+            total_seconds = total_online_seconds + total_offline_seconds
+            online_percentage = (total_online_seconds / total_seconds * 100) if total_seconds > 0 else 0
+            
+            # Return most recent sessions first (limit to last 100)
+            sessions.reverse()
+            sessions = sessions[:100]
+            
+            return {
+                "mobile_id": mobile_id,
+                "total_online_seconds": round(total_online_seconds, 2),
+                "total_offline_seconds": round(total_offline_seconds, 2),
+                "online_percentage": round(online_percentage, 2),
+                "total_online_events": online_events,
+                "total_offline_events": offline_events,
+                "first_event": first_event,
+                "last_event": last_event,
+                "sessions": sessions,
+            }
 
 
 if __name__ == "__main__":

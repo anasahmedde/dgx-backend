@@ -208,6 +208,25 @@ def ensure_dvsg_schema(conn):
     CREATE INDEX IF NOT EXISTS idx_device_temperature_did_recorded_at ON public.device_temperature(did, recorded_at DESC);
     """
 
+    # ------------------------------------------------------------------
+    # NEW: device_online_history table for uptime tracking
+    # ------------------------------------------------------------------
+    ddl_online_history_table = """
+    CREATE TABLE IF NOT EXISTS public.device_online_history (
+      id          BIGSERIAL PRIMARY KEY,
+      did         BIGINT NOT NULL,
+      event_type  TEXT NOT NULL,  -- 'online' or 'offline'
+      event_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CONSTRAINT device_online_history_device_fk FOREIGN KEY (did) REFERENCES public.device(id) ON DELETE CASCADE
+    );
+    """
+
+    ddl_online_history_indexes = """
+    CREATE INDEX IF NOT EXISTS idx_device_online_history_did ON public.device_online_history(did);
+    CREATE INDEX IF NOT EXISTS idx_device_online_history_event_at ON public.device_online_history(event_at);
+    CREATE INDEX IF NOT EXISTS idx_device_online_history_did_event_at ON public.device_online_history(did, event_at DESC);
+    """
+
     drop_old_uniq = """
     DO $$
     BEGIN
@@ -264,6 +283,8 @@ def ensure_dvsg_schema(conn):
         # NEW
         cur.execute(ddl_temperature_table)
         cur.execute(ddl_temperature_indexes)
+        cur.execute(ddl_online_history_table)
+        cur.execute(ddl_online_history_indexes)
 
         cur.execute(drop_old_uniq)
         cur.execute(ddl_unique_indexes)
